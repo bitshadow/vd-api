@@ -1,23 +1,155 @@
-name: Publish Alpha Version
+name: Version and Release
 
 on:
   workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - alpha
+      bump_type:
+        description: 'Version bump type (ignored for alpha)'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+  workflow_run:
+    workflows: ['Storybook to Chromatic']
+    types:
+      - completed
+    branches:
+      - main
 
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20.19.4
-      - run: yarn
-      - run: yarn test
-      - run: yarn build
-  publish-alpha:
-    needs: build-and-test
+  version-and-release:
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'release') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' && (
+        contains(github.event.workflow_run.head_commit.message, 'feat:') ||
+        contains(github.event.workflow_run.head_commit.message, 'fix:') ||
+        contains(github.event.workflow_run.head_commit.message, 'RELEASE')
+      ))
     runs-on: ubuntu-latest
     permissions:
+      id-token: write # Required for OIDC
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.4
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Initialize changelog
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "# Changelog\n\nAll notable changes to this project will be documented in this file." > CHANGELOG.md
+            git add CHANGELOG.md
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git config --local user.name "github-actions[bot]"
+            git commit -m "chore: initialize changelog [skip ci]"
+            git push
+          fi
+
+      - name: Install dependencies
+        run: |
+          yarn install
+          npm install -g npm@11.5.1 conventional-changelog-cli
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+      - name: Bump version
+        id: version
+        run: |
+          # Use input bump_type if workflow was triggered manually, otherwise use patch
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            BUMP_TYPE="${{ github.event.inputs.bump_type }}"
+          else
+            # Determine version bump type based on commit message for automatic triggers
+            if [[ "${{ github.event.workflow_run.head_commit.message }}" == *"feat:"* ]]; then
+              BUMP_TYPE="minor"
+            else
+              BUMP_TYPE="patch"
+            fi
+          fi
+
+          echo "Bumping version: $BUMP_TYPE"
+          npm --no-git-tag-version version $BUMP_TYPE
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          git add package.json
+          git commit -m "chore: bump version to ${VERSION} [skip ci]"
+          git push
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # First time generation if changelog is empty
+          if [ ! -s CHANGELOG.md ]; then
+            conventional-changelog -p angular -i CHANGELOG.md -s -r 0
+          else
+            # Generate changelog for the latest version
+            conventional-changelog -p angular -i CHANGELOG.md -s -r 1 > TEMP_CHANGELOG.md
+          fi
+
+          # Format changelog for GitHub Actions output
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          if [ -f TEMP_CHANGELOG.md ]; then
+            cat TEMP_CHANGELOG.md >> $GITHUB_OUTPUT
+          else
+            echo "Initial release" >> $GITHUB_OUTPUT
+          fi
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Commit changelog updates
+          git add CHANGELOG.md
+          git commit -m "docs: update changelog [skip ci]" || echo "No changelog changes to commit"
+          git push
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          release_name: Release v${{ steps.version.outputs.version }}
+          body: |
+            Release for version ${{ steps.version.outputs.version }}
+
+            ## What's Changed
+            ${{ steps.changelog.outputs.CHANGELOG }}
+
+            For full changelog, see [CHANGELOG.md](CHANGELOG.md)
+          draft: false
+          prerelease: false
+
+      - name: Publish to NPM
+        run: npm publish --access public
+
+  publish-alpha:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'alpha'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
       contents: read
 
     steps:
@@ -27,42 +159,33 @@ jobs:
           node-version: 20.19.4
           registry-url: 'https://registry.npmjs.org'
       - run: yarn
+      - run: yarn test
+      - run: yarn build
+
+      - name: Upgrade npm
+        run: npm install -g npm@11.5.1
+
       - name: Determine version
         id: version
         run: |
-          # Get current version from package.json
           CURRENT_VERSION=$(node -p "require('./package.json').version")
-
-          # Get short SHA
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-
-          # Get timestamp for uniqueness
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-
-          # Create alpha version: version-alpha.timestamp.sha
           ALPHA_VERSION="${CURRENT_VERSION}-alpha.${TIMESTAMP}.${SHORT_SHA}"
-
           echo "alpha_version=$ALPHA_VERSION" >> $GITHUB_OUTPUT
-          echo "branch_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-
           echo "📦 Alpha version: $ALPHA_VERSION"
 
       - name: Update package.json with alpha version
-        run: |
-          npm version ${{ steps.version.outputs.alpha_version }} --no-git-tag-version
+        run: npm version ${{ steps.version.outputs.alpha_version }} --no-git-tag-version
 
       - name: Publish alpha to NPM
         run: npm publish --access public --tag alpha
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Output summary
         run: |
           echo "## 🎉 Alpha Published Successfully!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Package:** @wlloyalty/wll-react-sdk" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** ${{ steps.version.outputs.alpha_version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Branch:** ${{ steps.version.outputs.branch_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Tag:** alpha" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Install" >> $GITHUB_STEP_SUMMARY
